@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Local data, weights and run outputs
+data/
+checkpoints/
+outputs/
+experiments/
+wandb/
+*.ckpt
+*.safetensors
+*.pt

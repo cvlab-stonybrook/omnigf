@@ -1,0 +1,267 @@
+
+# SPDX-FileCopyrightText: Copyright 2025 Idiap Research Institute <contact@idiap.ch>
+# SPDX-FileContributor: Qiaomu Miao
+# SPDX-License-Identifier: GPL-3.0-only
+
+# ============================================================================
+# VLM Gaze Prediction Configuration — Semantic variant
+# ============================================================================
+# Mirrors vlm_config.yaml but pre-fills the semantic-prediction paths and
+# defaults used by ``scripts/finetune_vlm_semantic.sh``. Pick this file
+# whenever you load a checkpoint trained with semantic supervision (e.g.
+# vlm_gf_semantic.ckpt) so the semantic vocab + SemGaze annotation roots
+# are wired up without needing CLI overrides.
+# ============================================================================
+
+device: cuda
+
+# Default to the disk where the SemGaze + GazeFollow data live for this
+# project. Override at the CLI (e.g. ``--disk_prefix /mnt/...``) if needed.
+disk_prefix: /path/to/data_root   # the scripts/ launchers set every path from scripts/paths.sh
+
+# --------------------------------------------------------------------------
+# Weights & Biases
+# --------------------------------------------------------------------------
+wandb:
+  project_name: VLM-Gaze-Semantic
+  username: null
+  log: True
+  watch_freq: 500
+  watch: null
+  group: null
+
+# --------------------------------------------------------------------------
+# VLM-specific configuration
+# --------------------------------------------------------------------------
+vlm:
+  approach: heatmap
+
+  model_name: Qwen/Qwen3-VL-4B-Instruct
+
+  train_lora: True
+  lora_rank: 16
+  lora_alpha: 32
+  lora_target_modules: [q_proj, v_proj]
+  gf_test_all_people: False
+
+  coord_bins: 1000
+  unknown_policy: exclude
+  # Semantic-finetune default. visualize_semantic.py forces
+  # ``point_semantic`` at load time; training uses ``point_then_category``.
+  prompt_mode: point_then_category
+  max_people: 5
+  mask_point_block_loss: False
+
+  social_gaze_mode: null
+
+  use_social_pair_head: False
+  social_pair_mid_dim: 256
+  social_pair_dropout: 0.1
+  social_pos_weight_lah: 3.0
+  social_pos_weight_laeo: 2.0
+  social_pos_weight_coatt: 2.0
+  lambda_social: 1.0
+  social_f1_threshold: 0.5
+  pseudo_loss_scale: 1.0
+  show_no_annotation_marker: False
+  sort_persons_lr_tb: False
+  sort_annotated_first: False
+  mask_per_person_lm_loss: False
+
+  # Generous decoding budget — point_semantic / point_then_category targets
+  # carry both coords and a category string per person.
+  max_new_tokens: 200
+
+  # Loss weights — match finetune_vlm_semantic.sh
+  lambda_lm: 1.0
+  lambda_bce: 0.0
+  lambda_kl: 0.2
+  lambda_hm: 1.0
+  heatmap_loss: mse
+  focal_mse_gamma: 2.0
+
+  decoder_type: conv_transpose
+  decoder_proj_dim: 256
+  hidden_dims: [128, 256, 512, 1024]
+  feature_dim: 128
+
+  vision_feature_source: llm
+  vit_feature_layer: -1
+
+  use_gaze_encoder: True
+  gaze_weights: ${disk_prefix}/ckpts/gaze/gaze360_resnet18.pt
+  gaze_feature_dim: 512
+
+  # ---- Semantic gaze prediction (the reason this file exists) ----
+  use_semantic_labels: True
+  use_semantic_head: False
+  semantic_input: heatmap_pool
+  semantic_embed_dim: 512
+  semantic_vocab_dir: ${disk_prefix}/datasets/gaze/semgaze/data/gazefollow/embeds_templated
+  test_vocab_embeddings: ${vlm.semantic_vocab_dir}/test_vocab_embeddings.pt
+  test_vocab_labels: ${vlm.semantic_vocab_dir}/test_vocab_labels.json
+  use_wordnet_reroute: False
+  wordnet_top_k: 10
+  lambda_semantic: 0.5
+  use_memory_bank: True
+  memory_bank_size: 1024
+
+  head_lr: 1e-4
+
+# --------------------------------------------------------------------------
+# Model
+# --------------------------------------------------------------------------
+model:
+  image_size: 448
+  head_size: 224
+  patch_size: 14
+
+# --------------------------------------------------------------------------
+# Data
+# --------------------------------------------------------------------------
+data:
+  num_people: 4
+  image_size: 448
+  heatmap_size: 64
+  head_size: 224
+  num_workers: 4
+  ann_root: ${disk_prefix}/datasets/gaze/VSGaze
+  gf_include_inout: False
+
+  gf_use_semgaze_bbox: False
+  gf_semgaze_ann_root: ${disk_prefix}/datasets/gaze/VSGaze/semgaze_merge
+
+  root_gazefollow: ${disk_prefix}/datasets/gaze/gazefollow
+  root_vat: ${disk_prefix}/datasets/gaze/videoattentiontarget
+  root_childplay: ${disk_prefix}/datasets/gaze/ChildPlay
+  root_videocoatt: ${disk_prefix}/datasets/gaze/VideoCoAtt_Dataset
+  root_uco_laeo: ${disk_prefix}/datasets/gaze/ucolaeodb
+  root_gazehoi: ${disk_prefix}/datasets/gaze/GazeHOI
+
+  gazehoi_ann_root: ${disk_prefix}/datasets/gaze/GazeHOI/h5_annotations
+  gazehoi_vocab2id_path: null
+
+  include_sources:
+    gazefollow: True
+    vat: False
+    childplay: False
+    videocoatt: False
+    uco_laeo: False
+    gazehoi: False
+
+  val_include_sources:
+    gazefollow: True
+    vat: False
+    childplay: False
+    videocoatt: False
+    uco_laeo: False
+    gazehoi: False
+
+  test_include_sources:
+    gazefollow: True
+    vat: False
+    childplay: False
+    videocoatt: False
+    uco_laeo: False
+    gazehoi: False
+
+  source_sampling:
+    gazefollow: 1.0
+    vat: 1.0
+    childplay: 1.0
+    videocoatt: 1.0
+    uco_laeo: 1.0
+    gazehoi: 1.0
+
+# --------------------------------------------------------------------------
+# Experiment
+# --------------------------------------------------------------------------
+experiment:
+  name: VLM-Gaze-Semantic
+  task: train+test
+  dataset: vlm_gaze
+  output_folder: ${disk_prefix}/ckpts/gaze/vlm_gazefollow_ge_semantic
+
+# --------------------------------------------------------------------------
+# Training — match finetune_vlm_semantic.sh
+# --------------------------------------------------------------------------
+train:
+  seed: 42
+  matmul_precision: medium
+  precision: bf16-mixed
+  epochs: 5
+  devices: -1
+  strategy: auto
+  batch_size: 8
+  accumulate_grad_batches: 2
+  resume: False
+  resume_from: null
+  pretrained_ckpt: null
+  use_all_data: False
+  swa:
+    use: False
+    lr: 1e-6
+    epoch_start: 8
+    annealing_epochs: 2
+
+# --------------------------------------------------------------------------
+# Validation / Test
+# --------------------------------------------------------------------------
+val:
+  batch_size: 8
+
+test:
+  checkpoint: null
+  batch_size: 1
+
+# --------------------------------------------------------------------------
+# Optimizer / Scheduler — match finetune_vlm_semantic.sh
+# --------------------------------------------------------------------------
+optimizer:
+  lr: 5e-5
+  weight_decay: 0.01
+
+scheduler:
+  type: constant
+  warmup_epochs: 0
+  t_0_epochs: 5
+  t_mult: 1
+
+# --------------------------------------------------------------------------
+# Hydra output directory
+# --------------------------------------------------------------------------
+hydra:
+  run:
+    dir: /${hydra:runtime.cwd}/../experiments/vlm_semantic/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+  job_logging:
+    version: 1
+
+    root:
+      level: INFO
+      handlers: [console, file]
+
+    handlers:
+      console:
+        class: colorlog.StreamHandler
+        formatter: color
+        stream: ext://sys.stdout
+      file:
+        class: logging.FileHandler
+        formatter: file
+        filename: ${hydra:run.dir}/vlm_train.log
+
+    formatters:
+      color:
+        format: "%(log_color)s%(asctime)s | %(name)s | %(levelname)-8s | %(message)s"
+        datefmt: "%H:%M:%S"
+        class: colorlog.ColoredFormatter
+        log_colors:
+          DEBUG:    cyan
+          INFO:     green
+          WARNING:  yellow
+          ERROR:    red
+          CRITICAL: bold_red
+      file:
+        format: "%(asctime)s | %(name)s | %(levelname)-8s | %(message)s"
+        datefmt: "%H:%M:%S"

@@ -1,0 +1,342 @@
+
+# SPDX-FileCopyrightText: Copyright 2025 Idiap Research Institute <contact@idiap.ch>
+# SPDX-FileContributor: Qiaomu Miao
+# SPDX-License-Identifier: GPL-3.0-only
+
+# ============================================================================
+# VLM Gaze Prediction Configuration
+# ============================================================================
+# This config is separate from config.yaml to avoid conflicts with the
+# original MTGS pipeline.  It reuses data paths but defines its own model,
+# training, and VLM-specific parameters.
+# ============================================================================
+
+device: cuda
+
+# --------------------------------------------------------------------------
+# Disk prefix
+# --------------------------------------------------------------------------
+# All dataset/checkpoint paths below are built off of this prefix using
+# OmegaConf interpolation (${disk_prefix}). Override from the shell with
+# `disk_prefix=/some/other/root`.
+disk_prefix: /path/to/data_root   # the scripts/ launchers set every path from scripts/paths.sh
+
+# --------------------------------------------------------------------------
+# Weights & Biases
+# --------------------------------------------------------------------------
+wandb:
+  project_name: VLM-Gaze-VSGaze
+  username: null
+  log: True
+  watch_freq: 500
+  watch: null
+  group: null
+
+# --------------------------------------------------------------------------
+# VLM-specific configuration
+# --------------------------------------------------------------------------
+vlm:
+  # Approach: "lm" (Approach 1), "heatmap" (3C), "patch_dist" (3D)
+  approach: heatmap
+  heatmap_loss: mse
+  # HuggingFace model identifier
+  model_name: Qwen/Qwen3-VL-4B-Instruct
+  vision_feature_source: llm
+  vit_feature_layer: -1
+
+  # LLM hidden-state layer read by the dense heads (see vlm_config.yaml for the
+  # full note). -1 = final layer. Requires retraining per value; ignored by the
+  # multi-layer dpt decoder, which uses decoder_hooks.
+  hidden_layer: -1
+  # Single-person evaluation ablation (test only). When True, each annotated
+  # person becomes its own sample with a single ``P0:`` prompt line, instead of
+  # all persons in one multi-person prompt. Person-level metrics stay
+  # comparable; forward passes go from 1/frame to N/frame (VAT test: 13,127
+  # frames -> 31,978 persons, ~2.44x). Use it to test whether multi-person
+  # context helps or hurts, and to measure the per-person baseline cost.
+  single_person_eval: False
+  # LoRA configuration
+  train_lora: True          # False = freeze LoRA adapters, train heads only
+  lora_rank: 16
+  lora_alpha: 32
+  lora_target_modules: [q_proj, v_proj]
+
+  # Prompt / target formatting
+  coord_bins: 1000
+  unknown_policy: exclude     # {exclude, include_marked}
+  prompt_mode: point          # {point, point_semantic}
+  max_people: 5
+
+  # Loss weights (approach-dependent; unused weights are ignored)
+  lambda_lm: 1.0             # LM cross-entropy weight (all approaches)
+  lambda_bce: 2.0            # BCE in/out weight (3C)
+  lambda_kl: 20.0            # KL divergence weight (3D)
+  lambda_hm: 1.0             # Heatmap MSE weight (3C, 3D)
+
+  # Heatmap decoder (used by "heatmap" and "patch_dist" approaches)
+  decoder_type: conv_transpose  # {conv_transpose, dpt}
+  decoder_proj_dim: 256         # projection dim for ConvTranspose decoder
+  # LLM hook layers for the DPT decoder (shallow -> deep). These were tuned for
+  # a ~28-layer model and leave the top 10 layers of the 36-layer Qwen3-VL-4B
+  # untapped; the evenly-spaced alternative is [8, 17, 26, 35].
+  decoder_hooks: [4, 10, 18, 26]
+  hidden_dims: [128, 256, 512, 1024]  # DPT hidden dims
+  feature_dim: 128              # DPT feature dim
+
+  # Gaze encoder (ResNet18 head crop encoder)
+  use_gaze_encoder: True       # inject gaze encoder features per person
+  gaze_weights: ${disk_prefix}/ckpts/gaze/gaze360_resnet18.pt            # path to Gaze360 ResNet18 checkpoint
+  gaze_feature_dim: 512         # intermediate feature dim in GazeEncoder
+
+  # Separate learning rate for prediction heads
+  head_lr: 1e-4
+  social_gaze_mode: null
+  mask_point_block_loss: false
+
+  # ---- Social-pair head (MTGS-style, orthogonal to text-block path) ----
+  # When True, instantiate ``SocialPairHead`` over the same per-person
+  # hidden states that the heatmap decoder reads, train it jointly with
+  # the BCE loss below, and report MTGS-style per-category AP/AUC/P/R/F1
+  # at val/test (per-gazer LAH F1, per-pair LAEO F1 with per-gazer
+  # argmax filter on pred, plain per-pair coatt F1).
+  use_social_pair_head: False
+  social_pair_mid_dim: 256
+  social_pair_dropout: 0.1
+  # Per-category positive-class weights inside BCE — defaults match
+  # MTGS ``train/losses.py:53-55`` (LAH=3 because positive LAH
+  # pairs are sparse; LAEO/coatt=2).
+  social_pos_weight_lah: 3.0
+  social_pos_weight_laeo: 2.0
+  social_pos_weight_coatt: 2.0
+  # Outer scale on the (lah+laeo+coatt) sum, against lambda_lm/lambda_hm.
+  lambda_social: 1.0
+  # Threshold for binarising sigmoid probs in P/R/F1 (AP/AUC are
+  # threshold-free). 0.5 matches MTGS's ``compute_metrics.py``.
+  social_f1_threshold: 0.5
+  # Per-person multiplicative scale applied to ``lambda_hm`` and
+  # ``lambda_bce`` for persons whose gaze label came from the MTGS
+  # pseudo-annotation pass (``is_pseudo == 1`` in the h5). 1.0 = no
+  # effect; set <1.0 to down-weight pseudo supervision. Social pair head
+  # losses are NOT scaled (those labels still mask via ``-1`` per pair).
+  pseudo_loss_scale: 1.0
+  # When True, append ``(no annotation)`` to the prompt line of persons
+  # whose ``inout == -1`` (correctly identified from the per-person GT,
+  # not by position). When False (default), every person in the prompt
+  # gets the same line format and the model is expected to predict for
+  # all of them.
+  show_no_annotation_marker: False
+  # When True, sort kept persons by head-bbox left edge ascending
+  # (left-to-right), with bbox top edge as tiebreaker. Pid 0 then always
+  # denotes the leftmost person. Applies consistently to prompt, target,
+  # per-person tensors, and social-gaze pair labels. Default False.
+  sort_persons_lr_tb: False
+  # When True, partition kept persons so all annotated (``inout != -1``)
+  # persons come first and unannotated persons come at the end. Composes
+  # with ``sort_persons_lr_tb`` (annotated-first dominates; L-R sort
+  # applies within each group when also enabled). Default False.
+  sort_annotated_first: False
+  # Person-token ordering ablation (reviewer request). One of:
+  #   dataset — no reorder. At TRAIN time the source loaders already apply a
+  #             random permutation (``get_shuffle_idx``), so the model is
+  #             trained order-agnostic; at VAL/TEST this is the raw H5
+  #             ``person_ids`` order. Default / historical behaviour.
+  #   lr_tb   — left-to-right by head-bbox x_min, top-to-bottom tiebreak.
+  #   rl_bt   — exact reverse of lr_tb.
+  #   random  — permutation seeded per-sample by (person_order_seed, index),
+  #             reproducible across re-runs and DataLoader workers.
+  # Eval-only ablation: needs no retraining, just re-run with task=test.
+  person_order: dataset
+  person_order_seed: 0
+  # When True: keep ``inout == -1`` persons in the training sample and
+  # emit a uniform ``P{pid}: {"status": "<word>", "point_2d": [...]}``
+  # line per person ("inside"/"outside"/"unknown" depending on inout).
+  # The collator masks the LM loss for every token of an unknown person's
+  # line after the ``P{pid}:`` prefix; heatmap MSE and inout BCE already
+  # mask inout=-1 via their own masks. Default False.
+  mask_per_person_lm_loss: False
+  # Upper bound on the autoregressive decoding length at val/test. Each
+  # decoded token is a full forward pass through the VLM, so tightening
+  # this is a direct linear speedup. Sensible per-prompt-mode ceilings
+  # (targets are ~20 tokens per annotated person on a 4-person sample):
+  #   point                  -> 128  (~80-token targets)
+  #   point_semantic         -> 160  (~120-token targets)
+  #   point_then_category    -> 192  (~170-token targets)
+  #   point_then_social      -> 384  (point block ~240 + social JSON ~80-150
+  #                                   for up to 8 inout∈{0,1} persons; gives
+  #                                   headroom for crowded VideoCoAtt frames
+  #                                   with multi-edge SA groups)
+  # Override from the shell via `vlm.max_new_tokens=<N>`.
+  max_new_tokens: 384
+# --------------------------------------------------------------------------
+# Model (minimal — VLM replaces DINOv2 + ResNet, but we keep the key for
+# image_size interpolation in data)
+# --------------------------------------------------------------------------
+model:
+  image_size: 448
+  head_size: 224
+  patch_size: 14          # Qwen ViT patch size (for reference only)
+
+# --------------------------------------------------------------------------
+# Data paths and settings
+# --------------------------------------------------------------------------
+data:
+  num_people: 5
+  image_size: 448
+  heatmap_size: 64
+  head_size: 224
+  num_workers: 4
+  ann_root: ${disk_prefix}/datasets/gaze/VSGaze           # update path to annotation root
+  # num_samples: 108955     # GazeFollow train set size (for scheduler calc)
+  # max_train_samples: null
+  # max_val_samples: null
+  # max_test_samples: null
+
+  # Dataset roots — update these paths
+  root_gazefollow: ${disk_prefix}/datasets/gaze/gazefollow
+  root_vat: ${disk_prefix}/datasets/gaze/videoattentiontarget
+  root_childplay: ${disk_prefix}/datasets/gaze/ChildPlay
+  root_videocoatt: ${disk_prefix}/datasets/gaze/VideoCoAtt_Dataset
+  root_uco_laeo: ${disk_prefix}/datasets/gaze/ucolaeodb
+  root_gazehoi: ${disk_prefix}/datasets/gaze/GazeHOI
+
+  # GazeHOI uses a separate h5 directory (built by
+  # ``scripts/llm_label_mapping/build_gazehoi_h5.py``) and a single shared
+  # CLIP-templated vocab (built by
+  # ``scripts/process_gazehoi/build_gazehoi_clip_vocab.py``).
+  gazehoi_ann_root: ${disk_prefix}/datasets/gaze/GazeHOI/h5_annotations
+  gazehoi_vocab2id_path: null
+
+
+  # Which source datasets to include (training)
+  include_sources:
+    gazefollow: False
+    vat: True
+    childplay: True
+    videocoatt: True
+    uco_laeo: True
+    gazehoi: False
+
+  # Which source datasets to include for validation.
+  # When null, falls back to include_sources above.
+  val_include_sources:
+    gazefollow: False
+    vat: True
+    childplay: True
+    videocoatt: True
+    uco_laeo: True
+    gazehoi: False
+
+
+  # Which source datasets to include for testing.
+  # When null, falls back to val_include_sources, then include_sources.
+  test_include_sources:
+    gazefollow: False
+    vat: True
+    childplay: True
+    videocoatt: True
+    uco_laeo: True
+    gazehoi: False
+
+  # Per-source sampling weights (for mixed training)
+  source_sampling:
+    gazefollow: 1.0
+    vat: 1.0
+    childplay: 1.0
+    videocoatt: 1.0
+    uco_laeo: 1.0
+    gazehoi: 1.0
+
+# --------------------------------------------------------------------------
+# Experiment
+# --------------------------------------------------------------------------
+experiment:
+  name: VLM-Gaze-LM
+  task: train+test        # {train, test, train+test}
+  dataset: vlm_gaze       # signals VLMGazeDataModule
+  output_folder: ${disk_prefix}/ckpts/gaze/vlm_social_gaze
+
+# --------------------------------------------------------------------------
+# Training
+# --------------------------------------------------------------------------
+train:
+  seed: 42
+  matmul_precision: medium
+  precision: bf16-mixed
+  epochs: 10
+  devices: 1
+  batch_size: 8           # VLM requires smaller batch sizes
+  accumulate_grad_batches: 8  # effective batch size = batch_size * accumulate_grad_batches
+  resume: False
+  resume_from: null
+  pretrained_ckpt: null   # path to a Lightning checkpoint to load weights from (no optimizer state)
+  use_all_data: false     # when true, merge train+val for training; save only last checkpoint
+  swa:
+    use: False            # disabled for VLM by default
+    lr: 1e-6
+    epoch_start: 8
+    annealing_epochs: 2
+
+# --------------------------------------------------------------------------
+# Validation / Test
+# --------------------------------------------------------------------------
+val:
+  batch_size: 2
+
+test:
+  checkpoint: null
+  batch_size: 1
+
+# --------------------------------------------------------------------------
+# Optimizer
+# --------------------------------------------------------------------------
+optimizer:
+  lr: 1e-5               # LoRA learning rate
+  weight_decay: 0.01
+
+# --------------------------------------------------------------------------
+# Scheduler
+# --------------------------------------------------------------------------
+scheduler:
+  type: CosineAnnealingWarmRestarts
+  warmup_epochs: 1
+  t_0_epochs: 10
+  t_mult: 1
+
+# --------------------------------------------------------------------------
+# Hydra output directory
+# --------------------------------------------------------------------------
+hydra:
+  run:
+    dir: /${hydra:runtime.cwd}/../experiments/vlm/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+  job_logging:
+    version: 1
+
+    root:
+      level: INFO
+      handlers: [console, file]
+
+    handlers:
+      console:
+        class: colorlog.StreamHandler
+        formatter: color
+        stream: ext://sys.stdout
+      file:
+        class: logging.FileHandler
+        formatter: file
+        filename: ${hydra:run.dir}/vlm_train.log
+
+    formatters:
+      color:
+        format: "%(log_color)s%(asctime)s | %(name)s | %(levelname)-8s | %(message)s"
+        datefmt: "%H:%M:%S"
+        class: colorlog.ColoredFormatter
+        log_colors:
+          DEBUG:    cyan
+          INFO:     green
+          WARNING:  yellow
+          ERROR:    red
+          CRITICAL: bold_red
+      file:
+        format: "%(asctime)s | %(name)s | %(levelname)-8s | %(message)s"
+        datefmt: "%H:%M:%S"
